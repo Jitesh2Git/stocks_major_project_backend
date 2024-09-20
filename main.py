@@ -149,3 +149,7 @@ def predict(data: InputData):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/")
+async def root():
+    return {"message": "Healthy"}
