@@ -153,3 +153,7 @@ def predict(data: InputData):
 @app.post("/")
 async def root():
     return {"message": "Healthy"}
+
+@app.get("/")
+def read_root():
+    return {"message": "Service is running"}
