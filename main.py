@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
-import warnings
+import pandas as pd
+import pickle
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
@@ -12,8 +12,8 @@ from transformers import pipeline
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from textblob import TextBlob
 from nrclex import NRCLex
-import numpy as np  # Use numpy instead of pandas
-import pickle
+import os
+import warnings
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -28,13 +28,13 @@ origins = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Lazy loading of models
+# Load models efficiently
 model_files = {
     'XGB_close_classifier': "general_data_models/XGB_close_classifier.pkl",
     'XGB_trade_classifier': "general_data_models/XGB_trade_classifier.pkl",
@@ -44,44 +44,35 @@ model_files = {
 
 models = {}
 
-def load_model(model_name, model_path):
-    if model_name not in models:
-        if os.path.exists(model_path):
-            with open(model_path, 'rb') as file:
-                models[model_name] = pickle.load(file)
-                print(f"Loaded {model_name} successfully.")
-        else:
-            raise HTTPException(status_code=500, detail=f"{model_name} model not found.")
-    return models[model_name]
+for model_name, model_path in model_files.items():
+    if os.path.exists(model_path):
+        with open(model_path, 'rb') as file:
+            models[model_name] = pickle.load(file)
+            print(f"Loaded {model_name} successfully.")
+    else:
+        raise HTTPException(status_code=500, detail=f"{model_name} model not found.")
 
-# NLTK downloads (Lazy download, ensure the downloads happen once)
-nltk.data.path.append("/nltk_data")  # Add path to avoid repeated downloads
-nltk.download('punkt', quiet=True)
-nltk.download('wordnet', quiet=True)
-nltk.download('stopwords', quiet=True)
-nltk.download('vader_lexicon', quiet=True)
+# Initialize NLTK and Transformers
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('averaged_perceptron_tagger_eng')
+nltk.download('wordnet')
+nltk.download('stopwords')
+nltk.download('vader_lexicon')
 
-# Initialize components
+# Specify the model and aggregation strategy to avoid warnings
+ner_pipeline = pipeline('ner', model="dbmdz/bert-large-cased-finetuned-conll03-english", aggregation_strategy="simple")
+sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
 tokenizer = TreebankWordTokenizer()
 stop_words = set(stopwords.words('english'))
-sia = SentimentIntensityAnalyzer()
-
-# Initialize NER model lazily
-ner_pipeline = None
-
-def load_ner_pipeline():
-    global ner_pipeline
-    if not ner_pipeline:
-        ner_pipeline = pipeline('ner', model="dbmdz/bert-large-cased-finetuned-conll03-english", aggregation_strategy="simple")
-    return ner_pipeline
 
 # Define input data model
 class InputData(BaseModel):
     headline: str
     ticker: int
 
-# Ticker mappings
+# Mapping ticker numbers to company names
 ticker_to_company = {
     0: 'AAPL',
     1: 'AMZN',
@@ -103,12 +94,9 @@ def get_pos_tag(tag):
         'V': wordnet.VERB,
         'N': wordnet.NOUN,
         'R': wordnet.ADV
-    }.get(tag[0], wordnet.NOUN)  # Default to NOUN
+    }.get(tag[0], wordnet.NOUN)  # Return NOUN as the default
 
 def extract_features(text, ticker):
-    # Load the NER pipeline lazily
-    ner_pipeline = load_ner_pipeline()
-    
     # Extract various text features
     blob = TextBlob(text).sentiment
     entities = ner_pipeline(text)
@@ -118,7 +106,7 @@ def extract_features(text, ticker):
     positive_word_count = sum(1 for word in tokens if sia.polarity_scores(word)['compound'] > 0.05)
     negative_word_count = sum(1 for word in tokens if sia.polarity_scores(word)['compound'] < -0.05)
 
-    features = {
+    inputdf = pd.DataFrame([{
         'Vader_sentiment_score': sia.polarity_scores(text)['compound'],
         'Blob_polarity': blob.polarity,
         'BlobSubjectivity': blob.subjectivity,
@@ -135,28 +123,22 @@ def extract_features(text, ticker):
         'sadness': emotion_scores.get('sadness', 0),
         'trust': emotion_scores.get('trust', 0),
         'Ticker': ticker
-    }
+    }])
 
-    return np.array([list(features.values())])
+    return inputdf
 
-# Asynchronous request handling
 @app.post("/predict")
-async def predict(data: InputData):
+def predict(data: InputData):
     try:
         preprocessed_text = preprocess_text(data.headline)
-        features = extract_features(preprocessed_text, data.ticker)
-
-        # Load models when required
-        trade_classifier = load_model('XGB_trade_classifier', model_files['XGB_trade_classifier'])
-        close_classifier = load_model('XGB_close_classifier', model_files['XGB_close_classifier'])
-        trade_regressor = load_model('xgb_regressor_trade', model_files['xgb_regressor_trade'])
-        close_regressor = load_model('xgb_regressor_close', model_files['xgb_regressor_close'])
+        features_df = extract_features(preprocessed_text, data.ticker)
+        features_df_numeric = features_df.select_dtypes(include=['int64', 'float64'])
 
         # Perform predictions
-        prob_trade = float(trade_classifier.predict_proba(features)[0, 1])
-        prob_close = float(close_classifier.predict_proba(features)[0, 1])
-        pred_trade = float(trade_regressor.predict(features)[0])
-        pred_close = float(close_regressor.predict(features)[0])
+        prob_trade = float(models['XGB_trade_classifier'].predict_proba(features_df_numeric)[0, 1])
+        prob_close = float(models['XGB_close_classifier'].predict_proba(features_df_numeric)[0, 1])
+        pred_trade = float(models['xgb_regressor_trade'].predict(features_df_numeric)[0])
+        pred_close = float(models['xgb_regressor_close'].predict(features_df_numeric)[0])
 
         return {
             "probability_trade": prob_trade,
