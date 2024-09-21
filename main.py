@@ -28,7 +28,7 @@ origins = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -127,8 +127,12 @@ def extract_features(text, ticker):
 
     return inputdf
 
+@app.get("/")
+async def root():
+    return {"message": "Server is Running"}
+
 @app.post("/predict")
-def predict(data: InputData):
+async def predict(data: InputData):
     try:
         preprocessed_text = preprocess_text(data.headline)
         features_df = extract_features(preprocessed_text, data.ticker)
@@ -149,4 +153,3 @@ def predict(data: InputData):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
