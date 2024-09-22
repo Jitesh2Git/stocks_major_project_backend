@@ -13,6 +13,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from textblob import TextBlob
 from nrclex import NRCLex
 import os
+import gc
 import warnings
 
 # Suppress specific warnings
@@ -34,23 +35,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models efficiently
+# Model file paths
 model_files = {
     'XGB_close_classifier': "general_data_models/XGB_close_classifier.pkl",
     'XGB_trade_classifier': "general_data_models/XGB_trade_classifier.pkl",
     'xgb_regressor_trade': "general_data_models/xgb_regressor_trade.pkl",
     'xgb_regressor_close': "general_data_models/xgb_regressor_close.pkl",
 }
-
-models = {}
-
-for model_name, model_path in model_files.items():
-    if os.path.exists(model_path):
-        with open(model_path, 'rb') as file:
-            models[model_name] = pickle.load(file)
-            print(f"Loaded {model_name} successfully.")
-    else:
-        raise HTTPException(status_code=500, detail=f"{model_name} model not found.")
 
 # Initialize NLTK and Transformers
 nltk.download('punkt')
@@ -127,6 +118,9 @@ def extract_features(text, ticker):
 
     return inputdf
 
+# Define an empty dictionary to store models
+models = {}
+
 @app.get("/")
 async def root():
     return {"message": "Server is Running"}
@@ -134,6 +128,23 @@ async def root():
 @app.post("/predict")
 async def predict(data: InputData):
     try:
+        # Lazy load models when needed
+        if 'XGB_trade_classifier' not in models:
+            with open(model_files['XGB_trade_classifier'], 'rb') as file:
+                models['XGB_trade_classifier'] = pickle.load(file)
+
+        if 'XGB_close_classifier' not in models:
+            with open(model_files['XGB_close_classifier'], 'rb') as file:
+                models['XGB_close_classifier'] = pickle.load(file)
+
+        if 'xgb_regressor_trade' not in models:
+            with open(model_files['xgb_regressor_trade'], 'rb') as file:
+                models['xgb_regressor_trade'] = pickle.load(file)
+
+        if 'xgb_regressor_close' not in models:
+            with open(model_files['xgb_regressor_close'], 'rb') as file:
+                models['xgb_regressor_close'] = pickle.load(file)
+
         preprocessed_text = preprocess_text(data.headline)
         features_df = extract_features(preprocessed_text, data.ticker)
         features_df_numeric = features_df.select_dtypes(include=['int64', 'float64'])
@@ -144,6 +155,13 @@ async def predict(data: InputData):
         pred_trade = float(models['xgb_regressor_trade'].predict(features_df_numeric)[0])
         pred_close = float(models['xgb_regressor_close'].predict(features_df_numeric)[0])
 
+        # After use, clear models from memory
+        del models['XGB_trade_classifier']
+        del models['XGB_close_classifier']
+        del models['xgb_regressor_trade']
+        del models['xgb_regressor_close']
+        gc.collect()  # Trigger garbage collection to free memory
+
         return {
             "probability_trade": prob_trade,
             "probability_close": prob_close,
@@ -152,4 +170,5 @@ async def predict(data: InputData):
         }
 
     except Exception as e:
+        print(f"Error during prediction: {e}")  # Log the exact error
         raise HTTPException(status_code=500, detail=str(e))
