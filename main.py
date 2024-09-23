@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
-import pickle
+import joblib
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
@@ -13,7 +13,6 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from textblob import TextBlob
 from nrclex import NRCLex
 import os
-import gc
 import warnings
 
 # Suppress specific warnings
@@ -35,13 +34,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Model file paths
+# Model paths
 model_files = {
-    'XGB_close_classifier': "general_data_models/XGB_close_classifier.pkl",
-    'XGB_trade_classifier': "general_data_models/XGB_trade_classifier.pkl",
-    'xgb_regressor_trade': "general_data_models/xgb_regressor_trade.pkl",
-    'xgb_regressor_close': "general_data_models/xgb_regressor_close.pkl",
+    'XGB_close_classifier': "compressed_models/XGB_close_classifier_compressed.pkl",
+    'XGB_trade_classifier': "compressed_models/XGB_trade_classifier_compressed.pkl",
+    'xgb_regressor_trade': "compressed_models/xgb_regressor_trade_compressed.pkl",
+    'xgb_regressor_close': "compressed_models/xgb_regressor_close_compressed.pkl",
 }
+
+# Initialize models dictionary
+models = {}
 
 # Initialize NLTK and Transformers
 nltk.download('punkt')
@@ -51,7 +53,7 @@ nltk.download('wordnet')
 nltk.download('stopwords')
 nltk.download('vader_lexicon')
 
-# Specify the model and aggregation strategy to avoid warnings
+# Initialize NLP tools
 ner_pipeline = pipeline('ner', model="dbmdz/bert-large-cased-finetuned-conll03-english", aggregation_strategy="simple")
 sia = SentimentIntensityAnalyzer()
 lemmatizer = WordNetLemmatizer()
@@ -63,16 +65,16 @@ class InputData(BaseModel):
     headline: str
     ticker: int
 
-# Mapping ticker numbers to company names
-ticker_to_company = {
-    0: 'AAPL',
-    1: 'AMZN',
-    2: 'MSFT',
-    3: 'NVDA',
-    4: 'TSLA'
-}
-
 # Helper functions
+def load_model(model_name):
+    if model_name not in models:
+        try:
+            models[model_name] = joblib.load(model_files[model_name])
+            print(f"Loaded {model_name} successfully.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    return models[model_name]
+
 def preprocess_text(text):
     tokens = tokenizer.tokenize(text.lower())
     tagged_tokens = nltk.pos_tag(tokens)
@@ -118,9 +120,6 @@ def extract_features(text, ticker):
 
     return inputdf
 
-# Define an empty dictionary to store models
-models = {}
-
 @app.get("/")
 async def root():
     return {"message": "Server is Running"}
@@ -128,39 +127,15 @@ async def root():
 @app.post("/predict")
 async def predict(data: InputData):
     try:
-        # Lazy load models when needed
-        if 'XGB_trade_classifier' not in models:
-            with open(model_files['XGB_trade_classifier'], 'rb') as file:
-                models['XGB_trade_classifier'] = pickle.load(file)
-
-        if 'XGB_close_classifier' not in models:
-            with open(model_files['XGB_close_classifier'], 'rb') as file:
-                models['XGB_close_classifier'] = pickle.load(file)
-
-        if 'xgb_regressor_trade' not in models:
-            with open(model_files['xgb_regressor_trade'], 'rb') as file:
-                models['xgb_regressor_trade'] = pickle.load(file)
-
-        if 'xgb_regressor_close' not in models:
-            with open(model_files['xgb_regressor_close'], 'rb') as file:
-                models['xgb_regressor_close'] = pickle.load(file)
-
         preprocessed_text = preprocess_text(data.headline)
         features_df = extract_features(preprocessed_text, data.ticker)
         features_df_numeric = features_df.select_dtypes(include=['int64', 'float64'])
 
-        # Perform predictions
-        prob_trade = float(models['XGB_trade_classifier'].predict_proba(features_df_numeric)[0, 1])
-        prob_close = float(models['XGB_close_classifier'].predict_proba(features_df_numeric)[0, 1])
-        pred_trade = float(models['xgb_regressor_trade'].predict(features_df_numeric)[0])
-        pred_close = float(models['xgb_regressor_close'].predict(features_df_numeric)[0])
-
-        # After use, clear models from memory
-        del models['XGB_trade_classifier']
-        del models['XGB_close_classifier']
-        del models['xgb_regressor_trade']
-        del models['xgb_regressor_close']
-        gc.collect()  # Trigger garbage collection to free memory
+        # Load models only when needed
+        prob_trade = float(load_model('XGB_trade_classifier').predict_proba(features_df_numeric)[0, 1])
+        prob_close = float(load_model('XGB_close_classifier').predict_proba(features_df_numeric)[0, 1])
+        pred_trade = float(load_model('xgb_regressor_trade').predict(features_df_numeric)[0])
+        pred_close = float(load_model('xgb_regressor_close').predict(features_df_numeric)[0])
 
         return {
             "probability_trade": prob_trade,
@@ -170,5 +145,4 @@ async def predict(data: InputData):
         }
 
     except Exception as e:
-        print(f"Error during prediction: {e}")  # Log the exact error
         raise HTTPException(status_code=500, detail=str(e))
